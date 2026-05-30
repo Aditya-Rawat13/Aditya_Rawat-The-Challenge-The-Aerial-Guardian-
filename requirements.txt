@@ -1,0 +1,34 @@
+# Aerial Guardian — Python Dependencies
+# ==========================================
+# Tested on Python 3.10+
+
+# Core DL framework
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Object detection
+ultralytics>=8.1.0       # YOLOv8 — includes YOLOv8n (~6MB model)
+
+# Sliced inference for small objects
+sahi>=0.11.17            # Slicing Aided Hyper Inference
+
+# Computer vision
+opencv-python>=4.8.0
+opencv-contrib-python>=4.8.0   # For ORB, SIFT, ECC in GMC
+
+# Scientific computing
+numpy>=1.24.0
+scipy>=1.10.0            # Hungarian algorithm (linear_sum_assignment)
+
+# Config
+pyyaml>=6.0
+
+# ONNX inference (optional, for edge deployment testing)
+onnxruntime>=1.16.0
+
+# Visualization / dev
+matplotlib>=3.7.0
+Pillow>=10.0.0
+
+# Progress bars
+tqdm>=4.65.0

@@ -1,0 +1,22 @@
+# Aerial Guardian — Fast/Lightweight Config
+# ==========================================
+# Optimized for edge deployment (Jetson Nano, Raspberry Pi + Coral)
+# Trade: Lower recall on very small persons, higher FPS
+
+model_path: "weights/yolov8n_visdrone.pt"
+conf_threshold: 0.30
+iou_threshold:  0.45
+
+use_sahi: false            # Disabled for speed
+
+tracker:
+  track_thresh:  0.40
+  match_thresh:  0.75
+  track_buffer:  20
+  min_box_area:  8
+  frame_rate:    15
+
+gmc_method: "optflow"     # Faster than ORB on edge
+gmc_downscale: 4.0        # More aggressive downscale
+
+tail_length: 20

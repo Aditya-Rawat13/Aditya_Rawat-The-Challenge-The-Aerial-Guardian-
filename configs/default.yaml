@@ -1,0 +1,35 @@
+# Aerial Guardian — Default Configuration
+# ==========================================
+# Optimized for VisDrone drone footage (person tracking)
+
+# --- Model ---
+model_path: "weights/yolov8n_visdrone.pt"   # YOLOv8 nano, fine-tuned on VisDrone
+conf_threshold: 0.25                         # Detection confidence threshold
+iou_threshold:  0.45                         # NMS IoU threshold
+
+# --- SAHI Sliced Inference ---
+# Cuts frame into overlapping tiles for small object detection
+use_sahi: true
+slice_height: 320          # Tile height in pixels
+slice_width:  320          # Tile width in pixels
+overlap_ratio: 0.2         # 20% overlap between tiles
+
+# --- Tracker (ByteTrack) ---
+tracker:
+  track_thresh:  0.45      # Min confidence to start/maintain a track
+  match_thresh:  0.80      # Max IoU cost to accept an association
+  track_buffer:  30        # Frames to keep a lost track alive
+  min_box_area:  10        # Ignore tiny boxes (noise)
+  frame_rate:    30        # Video frame rate (for lost-track timeout)
+
+# --- Camera Motion Compensation ---
+gmc_method: "orb"          # orb | sift | ecc | optflow
+gmc_downscale: 2.0         # Downscale factor for GMC speed
+
+# --- Visualization ---
+tail_length: 40            # Trajectory tail length (frames)
+
+# --- Performance ---
+# On CPU (Intel i7): ~8-12 FPS with SAHI, ~25-30 FPS without
+# On GPU (RTX 3060): ~35-45 FPS with SAHI, ~60+ FPS without
+# Jetson Orin (INT8 TRT): ~20-25 FPS with SAHI
