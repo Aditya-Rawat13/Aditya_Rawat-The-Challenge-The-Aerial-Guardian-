@@ -1,16 +1,5 @@
-"""
-ByteTrack — Multi-Object Tracker
-Based on: "ByteTrack: Multi-Object Tracking by Associating Every Detection Box" (Zhang et al., 2022)
-
-Key insight: Use BOTH high-confidence AND low-confidence detections.
-- High-conf detections → associate with existing tracks (standard)
-- Low-conf detections → try to recover lost/occluded tracks (ByteTrack's innovation)
-
-This significantly reduces ID switches in crowded/occluded drone footage.
-"""
-
 import numpy as np
-from typing import List, Tuple
+from typing import List
 from collections import OrderedDict
 
 from .kalman_filter import KalmanFilter
@@ -18,305 +7,254 @@ from .lap_solver import linear_assignment
 from .matching import iou_distance, fuse_score
 
 
-class TrackState:
-    New      = 0
-    Tracked  = 1
-    Lost     = 2
-    Removed  = 3
+class TrkSta:
+    New     = 0
+    Tracked = 1
+    Lost    = 2
+    Removed = 3
 
 
 class STrack:
-    """
-    Single object track — maintains Kalman state, track ID, and status.
-    State vector: [cx, cy, w, h, vx, vy, vw, vh]
-    """
-    shared_kalman = KalmanFilter()
-    _id_count = 0
+    sha_kal = KalmanFilter()
+    _id_cnt = 0
 
-    def __init__(self, tlwh: np.ndarray, score: float):
+    def __init__(self, tlwh: np.ndarray, sco: float):
         self._tlwh = np.asarray(tlwh, dtype=np.float32)
-        self.kalman_state = None
-        self.is_activated = False
-        self.score = score
-        self.tracklet_len = 0
-        self.state = TrackState.New
-        self.frame_id = 0
-        self.start_frame = 0
-        self.track_id = 0
+        self.kal_sta = None
+        self.is_act = False
+        self.sco = sco
+        self.trk_len = 0
+        self.sta = TrkSta.New
+        self.fid = 0
+        self.sta_fid = 0
+        self.tid = 0
 
     @staticmethod
-    def next_id():
-        STrack._id_count += 1
-        return STrack._id_count
+    def nxt_id():
+        STrack._id_cnt += 1
+        return STrack._id_cnt
 
-    def activate(self, frame_id: int):
-        self.track_id = self.next_id()
-        self.kalman_state = self.shared_kalman.initiate(self.tlwh_to_xyah(self._tlwh))
-        self.tracklet_len = 0
-        self.state = TrackState.Tracked
-        self.is_activated = True
-        self.frame_id = frame_id
-        self.start_frame = frame_id
+    def act(self, fid: int):
+        self.tid = self.nxt_id()
+        self.kal_sta = self.sha_kal.initiate(self.tlwh_to_xyah(self._tlwh))
+        self.trk_len = 0
+        self.sta = TrkSta.Tracked
+        self.is_act = True
+        self.fid = fid
+        self.sta_fid = fid
 
-    def re_activate(self, new_track: "STrack", frame_id: int, new_id: bool = False):
-        self.kalman_state = self.shared_kalman.update(
-            self.kalman_state, self.tlwh_to_xyah(new_track.tlwh)
+    def re_act(self, new_trk: "STrack", fid: int, new_id: bool = False):
+        self.kal_sta = self.sha_kal.update(
+            self.kal_sta, self.tlwh_to_xyah(new_trk.tlwh)
         )
-        self.tracklet_len = 0
-        self.state = TrackState.Tracked
-        self.is_activated = True
-        self.frame_id = frame_id
-        self.score = new_track.score
+        self.trk_len = 0
+        self.sta = TrkSta.Tracked
+        self.is_act = True
+        self.fid = fid
+        self.sco = new_trk.sco
         if new_id:
-            self.track_id = self.next_id()
+            self.tid = self.nxt_id()
 
-    def update(self, new_track: "STrack", frame_id: int):
-        self.frame_id = frame_id
-        self.tracklet_len += 1
-        self.kalman_state = self.shared_kalman.update(
-            self.kalman_state, self.tlwh_to_xyah(new_track.tlwh)
+    def upd(self, new_trk: "STrack", fid: int):
+        self.fid = fid
+        self.trk_len += 1
+        self.kal_sta = self.sha_kal.update(
+            self.kal_sta, self.tlwh_to_xyah(new_trk.tlwh)
         )
-        self.state = TrackState.Tracked
-        self.is_activated = True
-        self.score = new_track.score
+        self.sta = TrkSta.Tracked
+        self.is_act = True
+        self.sco = new_trk.sco
 
-    def predict(self):
-        if self.kalman_state is not None:
-            self.kalman_state = self.shared_kalman.predict(self.kalman_state)
+    def pre(self):
+        if self.kal_sta is not None:
+            self.kal_sta = self.sha_kal.predict(self.kal_sta)
 
-    def apply_camera_motion(self, warp_matrix: np.ndarray):
-        """
-        Adjust track position based on estimated camera (drone) motion.
-        Transforms track center by the affine warp matrix so the tracker
-        doesn't confuse camera pan/tilt with actual object movement.
-        """
-        if self.kalman_state is None:
+    def apl_cam(self, war: np.ndarray):
+        if self.kal_sta is None:
             return
-        # Extract center from state
-        mean = self.kalman_state[0].copy()
-        cx, cy = mean[0], mean[1]
-        # Apply 2x3 affine warp
+        mea = self.kal_sta[0].copy()
+        cx, cy = mea[0], mea[1]
         pt = np.array([[[cx, cy]]], dtype=np.float32)
-        warped = cv2.transform(pt, warp_matrix)[0][0]
-        # Update mean position in-place
-        self.kalman_state[0][0] = warped[0]
-        self.kalman_state[0][1] = warped[1]
+        wpt = cv2.transform(pt, war)[0][0]
+        self.kal_sta[0][0] = wpt[0]
+        self.kal_sta[0][1] = wpt[1]
 
-    def mark_lost(self):
-        self.state = TrackState.Lost
+    def mrk_los(self):
+        self.sta = TrkSta.Lost
 
-    def mark_removed(self):
-        self.state = TrackState.Removed
+    def mrk_rem(self):
+        self.sta = TrkSta.Removed
 
     @property
     def tlwh(self) -> np.ndarray:
-        """Top-left-width-height from Kalman state."""
-        if self.kalman_state is None:
+        if self.kal_sta is None:
             return self._tlwh.copy()
-        mean = self.kalman_state[0].copy()
-        mean[2] *= mean[3]           # w = aspect * h
-        mean[:2] -= mean[2:4] / 2   # top-left = center - half wh
-        return mean[:4]
+        mea = self.kal_sta[0].copy()
+        mea[2] *= mea[3]
+        mea[:2] -= mea[2:4] / 2
+        return mea[:4]
 
     @property
     def tlbr(self) -> np.ndarray:
-        """Top-left-bottom-right."""
         tlwh = self.tlwh
         return np.array([tlwh[0], tlwh[1], tlwh[0]+tlwh[2], tlwh[1]+tlwh[3]])
 
     @staticmethod
     def tlwh_to_xyah(tlwh: np.ndarray) -> np.ndarray:
-        """Convert [x,y,w,h] → [cx,cy,aspect,h]."""
         x, y, w, h = tlwh
         return np.array([x + w/2, y + h/2, w / (h + 1e-6), h], dtype=np.float32)
 
     def __repr__(self):
-        return f"OT_{self.track_id}({self.start_frame}-{self.frame_id})"
+        return f"OT_{self.tid}({self.sta_fid}-{self.fid})"
 
 
 class BYTETracker:
-    """
-    ByteTrack tracker.
 
-    Two-round association:
-    Round 1: High-confidence detections ↔ active tracks (IoU matching)
-    Round 2: Low-confidence detections  ↔ lost tracks   (IoU matching)
-
-    This second round is the key innovation — it allows recovery of
-    temporarily occluded persons before they get a new ID.
-    """
-
-    def __init__(self, config: dict):
-        self.track_thresh    = config.get("track_thresh", 0.45)
-        self.match_thresh    = config.get("match_thresh", 0.8)
-        self.track_buffer    = config.get("track_buffer", 30)
-        self.min_box_area    = config.get("min_box_area", 10)
-        self.frame_rate      = config.get("frame_rate", 30)
+    def __init__(self, cfg: dict):
+        self.trk_thr = cfg.get("track_thresh", 0.45)
+        self.mat_thr = cfg.get("match_thresh", 0.8)
+        self.trk_buf = cfg.get("track_buffer", 30)
+        self.min_box = cfg.get("min_box_area", 10)
+        self.frm_rat = cfg.get("frame_rate", 30)
 
         self.tracked_stracks: List[STrack] = []
         self.lost_stracks:    List[STrack] = []
         self.removed_stracks: List[STrack] = []
 
-        self.frame_id = 0
-        self.max_time_lost = int(self.frame_rate / 30.0 * self.track_buffer)
+        self.fid = 0
+        self.max_los = int(self.frm_rat / 30.0 * self.trk_buf)
 
-        # Reset global ID counter for clean runs
-        STrack._id_count = 0
+        STrack._id_cnt = 0
 
-    def update(self, dets: np.ndarray, img_size: List[int], ori_img_size: List[int]) -> List[STrack]:
-        """
-        Args:
-            dets: [N, 5] array of [x1, y1, x2, y2, score]
-            img_size: [H, W] of processed frame
-            ori_img_size: [H, W] of original frame
+    def update(self, det: np.ndarray, img_siz: List[int], ori_siz: List[int]) -> List[STrack]:
+        self.fid += 1
 
-        Returns:
-            List of active STrack objects for this frame
-        """
-        self.frame_id += 1
-
-        # Split detections into high/low confidence
-        if len(dets) > 0:
-            scores = dets[:, 4]
-            bboxes = dets[:, :4]
-            # Convert xyxy → tlwh
-            tlwhs = np.stack([
-                bboxes[:, 0],
-                bboxes[:, 1],
-                bboxes[:, 2] - bboxes[:, 0],
-                bboxes[:, 3] - bboxes[:, 1],
+        if len(det) > 0:
+            sco = det[:, 4]
+            box = det[:, :4]
+            tlw = np.stack([
+                box[:, 0],
+                box[:, 1],
+                box[:, 2] - box[:, 0],
+                box[:, 3] - box[:, 1],
             ], axis=1)
 
-            hi_mask = scores >= self.track_thresh
-            lo_mask = (~hi_mask) & (scores > 0.1)
+            hi_msk = sco >= self.trk_thr
+            lo_msk = (~hi_msk) & (sco > 0.1)
 
-            dets_hi = [STrack(tlwhs[i], scores[i]) for i in np.where(hi_mask)[0]]
-            dets_lo = [STrack(tlwhs[i], scores[i]) for i in np.where(lo_mask)[0]]
+            det_hi = [STrack(tlw[i], sco[i]) for i in np.where(hi_msk)[0]]
+            det_lo = [STrack(tlw[i], sco[i]) for i in np.where(lo_msk)[0]]
         else:
-            dets_hi, dets_lo = [], []
+            det_hi, det_lo = [], []
 
-        # Classify current tracks
-        unconfirmed = []
-        tracked_stracks = []
+        unc = []
+        trk_act = []
         for t in self.tracked_stracks:
-            if not t.is_activated:
-                unconfirmed.append(t)
+            if not t.is_act:
+                unc.append(t)
             else:
-                tracked_stracks.append(t)
+                trk_act.append(t)
 
-        # Predict new positions via Kalman filter
-        strack_pool = joint_stracks(tracked_stracks, self.lost_stracks)
-        for st in strack_pool:
-            st.predict()
+        pol = jnt_str(trk_act, self.lost_stracks)
+        for st in pol:
+            st.pre()
 
-        # ── Round 1: High-confidence dets ↔ active tracks ──────────────────
-        dists = iou_distance(strack_pool, dets_hi)
-        dists = fuse_score(dists, dets_hi)
-        matches, u_track, u_det_hi = linear_assignment(dists, thresh=self.match_thresh)
+        dis = iou_distance(pol, det_hi)
+        dis = fuse_score(dis, det_hi)
+        mat, u_trk, u_det_hi = linear_assignment(dis, thresh=self.mat_thr)
 
-        activated, refound = [], []
-        for itrack, idet in matches:
-            track = strack_pool[itrack]
-            det   = dets_hi[idet]
-            if track.state == TrackState.Tracked:
-                track.update(det, self.frame_id)
-                activated.append(track)
+        act, ref = [], []
+        for itr, idet in mat:
+            trk = pol[itr]
+            d   = det_hi[idet]
+            if trk.sta == TrkSta.Tracked:
+                trk.upd(d, self.fid)
+                act.append(trk)
             else:
-                track.re_activate(det, self.frame_id)
-                refound.append(track)
+                trk.re_act(d, self.fid)
+                ref.append(trk)
 
-        # ── Round 2: Low-confidence dets ↔ unmatched lost tracks ───────────
-        # This is ByteTrack's key contribution: recovering occluded objects
-        r_tracked = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
-        dists2 = iou_distance(r_tracked, dets_lo)
-        matches2, u_track2, _ = linear_assignment(dists2, thresh=0.5)
+        r_trk = [pol[i] for i in u_trk if pol[i].sta == TrkSta.Tracked]
+        dis2 = iou_distance(r_trk, det_lo)
+        mat2, u_trk2, _ = linear_assignment(dis2, thresh=0.5)
 
-        for itrack, idet in matches2:
-            track = r_tracked[itrack]
-            det   = dets_lo[idet]
-            if track.state == TrackState.Tracked:
-                track.update(det, self.frame_id)
-                activated.append(track)
+        for itr, idet in mat2:
+            trk = r_trk[itr]
+            d   = det_lo[idet]
+            if trk.sta == TrkSta.Tracked:
+                trk.upd(d, self.fid)
+                act.append(trk)
             else:
-                track.re_activate(det, self.frame_id)
-                refound.append(track)
+                trk.re_act(d, self.fid)
+                ref.append(trk)
 
-        # Mark remaining unmatched active tracks as lost
-        lost = []
-        for i in u_track2:
-            track = r_tracked[i]
-            if track.state != TrackState.Lost:
-                track.mark_lost()
-                lost.append(track)
+        los = []
+        for i in u_trk2:
+            trk = r_trk[i]
+            if trk.sta != TrkSta.Lost:
+                trk.mrk_los()
+                los.append(trk)
 
-        # ── Unconfirmed tracks ↔ remaining high-conf dets ───────────────────
-        u_dets_hi = [dets_hi[i] for i in u_det_hi]
-        dists3 = iou_distance(unconfirmed, u_dets_hi)
-        matches3, u_unconf, u_det_hi2 = linear_assignment(dists3, thresh=0.7)
+        u_det_hi2_lst = [det_hi[i] for i in u_det_hi]
+        dis3 = iou_distance(unc, u_det_hi2_lst)
+        mat3, u_unc, u_det_hi2 = linear_assignment(dis3, thresh=0.7)
 
-        for itrack, idet in matches3:
-            unconfirmed[itrack].update(u_dets_hi[idet], self.frame_id)
-            activated.append(unconfirmed[itrack])
+        for itr, idet in mat3:
+            unc[itr].upd(u_det_hi2_lst[idet], self.fid)
+            act.append(unc[itr])
 
-        for i in u_unconf:
-            unconfirmed[i].mark_removed()
+        for i in u_unc:
+            unc[i].mrk_rem()
 
-        # Initialise new tracks from unmatched high-conf dets
-        new_tracks = []
+        new_trk = []
         for i in u_det_hi2:
-            det = u_dets_hi[i]
-            if det.score >= self.track_thresh:
-                det.activate(self.frame_id)
-                new_tracks.append(det)
+            d = u_det_hi2_lst[i]
+            if d.sco >= self.trk_thr:
+                d.act(self.fid)
+                new_trk.append(d)
 
-        # Remove stale lost tracks
-        removed = []
-        for track in self.lost_stracks:
-            if self.frame_id - track.frame_id > self.max_time_lost:
-                track.mark_removed()
-                removed.append(track)
+        rem = []
+        for trk in self.lost_stracks:
+            if self.fid - trk.fid > self.max_los:
+                trk.mrk_rem()
+                rem.append(trk)
 
-        # Update state pools
-        self.tracked_stracks = [t for t in self.tracked_stracks if t.state == TrackState.Tracked]
-        self.tracked_stracks  = joint_stracks(self.tracked_stracks, activated)
-        self.tracked_stracks  = joint_stracks(self.tracked_stracks, refound)
-        self.lost_stracks     = sub_stracks(self.lost_stracks, self.tracked_stracks)
-        self.lost_stracks.extend(lost)
-        self.lost_stracks     = sub_stracks(self.lost_stracks, removed)
-        self.removed_stracks.extend(removed)
-        self.tracked_stracks, self.lost_stracks = remove_duplicate_stracks(
+        self.tracked_stracks = [t for t in self.tracked_stracks if t.sta == TrkSta.Tracked]
+        self.tracked_stracks = jnt_str(self.tracked_stracks, act)
+        self.tracked_stracks = jnt_str(self.tracked_stracks, ref)
+        self.lost_stracks    = sub_str(self.lost_stracks, self.tracked_stracks)
+        self.lost_stracks.extend(los)
+        self.lost_stracks    = sub_str(self.lost_stracks, rem)
+        self.removed_stracks.extend(rem)
+        self.tracked_stracks, self.lost_stracks = rem_dup(
             self.tracked_stracks, self.lost_stracks
         )
 
-        output = [t for t in self.tracked_stracks if t.is_activated]
-        return output
+        return [t for t in self.tracked_stracks if t.is_act]
 
-    def compensate_camera_motion(self, warp_matrix: np.ndarray):
-        """Apply GMC warp to all active track positions."""
+    def compensate_camera_motion(self, war: np.ndarray):
         import cv2
-        for track in self.tracked_stracks + self.lost_stracks:
-            track.apply_camera_motion(warp_matrix)
+        for trk in self.tracked_stracks + self.lost_stracks:
+            trk.apl_cam(war)
 
 
-# ── Utility functions ──────────────────────────────────────────────────────────
+def jnt_str(a: List[STrack], b: List[STrack]) -> List[STrack]:
+    exi = {t.tid: t for t in a}
+    return a + [t for t in b if t.tid not in exi]
 
-def joint_stracks(a: List[STrack], b: List[STrack]) -> List[STrack]:
-    exists = {t.track_id: t for t in a}
-    return a + [t for t in b if t.track_id not in exists]
+def sub_str(a: List[STrack], b: List[STrack]) -> List[STrack]:
+    ids = {t.tid for t in b}
+    return [t for t in a if t.tid not in ids]
 
-def sub_stracks(a: List[STrack], b: List[STrack]) -> List[STrack]:
-    ids = {t.track_id for t in b}
-    return [t for t in a if t.track_id not in ids]
-
-def remove_duplicate_stracks(stracksa, stracksb):
-    dists = iou_distance(stracksa, stracksb)
-    pairs = np.where(dists < 0.15)
-    dupa, dupb = set(), set()
-    for p, q in zip(*pairs):
-        ta = stracksa[p].frame_id - stracksa[p].start_frame
-        tb = stracksb[q].frame_id - stracksb[q].start_frame
-        if ta > tb: dupb.add(q)
-        else:       dupa.add(p)
-    resa = [t for i, t in enumerate(stracksa) if i not in dupa]
-    resb = [t for i, t in enumerate(stracksb) if i not in dupb]
-    return resa, resb
+def rem_dup(str_a, str_b):
+    dis = iou_distance(str_a, str_b)
+    pai = np.where(dis < 0.15)
+    dup_a, dup_b = set(), set()
+    for p, q in zip(*pai):
+        ta = str_a[p].fid - str_a[p].sta_fid
+        tb = str_b[q].fid - str_b[q].sta_fid
+        if ta > tb: dup_b.add(q)
+        else:       dup_a.add(p)
+    res_a = [t for i, t in enumerate(str_a) if i not in dup_a]
+    res_b = [t for i, t in enumerate(str_b) if i not in dup_b]
+    return res_a, res_b

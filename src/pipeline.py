@@ -1,8 +1,3 @@
-"""
-Aerial Guardian - Drone Person Detection & Tracking Pipeline
-Architecture: YOLOv8n + SAHI tiling + ByteTrack + GMC (camera motion compensation)
-"""
-
 import cv2
 import numpy as np
 import torch
@@ -24,245 +19,191 @@ from utils.visualization import Visualizer
 from utils.metrics import FPSCounter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
 class AerialGuardianPipeline:
-    """
-    End-to-end drone person detection and tracking pipeline.
 
-    Key design decisions:
-    1. YOLOv8n (~6MB) for lightweight inference
-    2. SAHI slicing for small object detection (persons at high altitude)
-    3. ByteTrack for robust multi-object tracking
-    4. Global Motion Compensation to handle drone ego-motion
-    5. Trajectory tails for visual history
-    """
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.dev = "cuda" if torch.cuda.is_available() else "cpu"
+        log.info(f"Using device: {self.dev}")
 
-    def __init__(self, config: dict):
-        self.config = config
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"Using device: {self.device}")
+        self.mod = YOLO(cfg["model_path"])
 
-        # --- Detector ---
-        logger.info("Loading YOLOv8n detector...")
-        self.model = YOLO(config["model_path"])
-
-        # SAHI wrapper for sliced inference (small object detection)
-        self.sahi_model = AutoDetectionModel.from_pretrained(
+        self.sah = AutoDetectionModel.from_pretrained(
             model_type="yolov8",
-            model_path=config["model_path"],
-            confidence_threshold=config["conf_threshold"],
-            device=self.device,
+            model_path=cfg["model_path"],
+            confidence_threshold=cfg["conf_threshold"],
+            device=self.dev,
         )
 
-        # --- Tracker ---
-        self.tracker = BYTETracker(config["tracker"])
+        self.trk = BYTETracker(cfg["tracker"])
+        self.gmc = GlobalMotionCompensation(method=cfg.get("gmc_method", "orb"))
+        self.viz = Visualizer(tail_length=cfg.get("tail_length", 30), colors_seed=42)
+        self.fps = FPSCounter(window=30)
+        self.fid = 0
+        self.his: Dict[int, deque] = defaultdict(lambda: deque(maxlen=cfg.get("tail_length", 30)))
 
-        # --- Camera Motion Compensator ---
-        self.gmc = GlobalMotionCompensation(method=config.get("gmc_method", "orb"))
+        log.info("Pipeline initialized successfully.")
 
-        # --- Visualization ---
-        self.viz = Visualizer(
-            tail_length=config.get("tail_length", 30),
-            colors_seed=42,
-        )
+    def det(self, frm: np.ndarray) -> np.ndarray:
+        use = self.cfg.get("use_sahi", True)
 
-        # --- FPS Counter ---
-        self.fps_counter = FPSCounter(window=30)
-
-        # State
-        self.frame_id = 0
-        self.track_history: Dict[int, deque] = defaultdict(lambda: deque(maxlen=config.get("tail_length", 30)))
-
-        logger.info("Pipeline initialized successfully.")
-
-    def detect(self, frame: np.ndarray) -> np.ndarray:
-        """
-        Run detection using SAHI sliced inference.
-        Returns detections array: [x1, y1, x2, y2, conf, class_id]
-
-        SAHI splits the frame into overlapping tiles and merges results via NMS,
-        dramatically improving recall for small (drone-altitude) persons.
-        """
-        use_sahi = self.config.get("use_sahi", True)
-
-        if use_sahi:
-            result = get_sliced_prediction(
-                frame,
-                self.sahi_model,
-                slice_height=self.config.get("slice_height", 320),
-                slice_width=self.config.get("slice_width", 320),
-                overlap_height_ratio=self.config.get("overlap_ratio", 0.2),
-                overlap_width_ratio=self.config.get("overlap_ratio", 0.2),
-                perform_standard_pred=True,   # also run full-frame pass
-                postprocess_type="NMM",        # Non-maximum merging (better than NMS for SAHI)
+        if use:
+            res = get_sliced_prediction(
+                frm,
+                self.sah,
+                slice_height=self.cfg.get("slice_height", 320),
+                slice_width=self.cfg.get("slice_width", 320),
+                overlap_height_ratio=self.cfg.get("overlap_ratio", 0.2),
+                overlap_width_ratio=self.cfg.get("overlap_ratio", 0.2),
+                perform_standard_pred=True,
+                postprocess_type="NMM",
                 postprocess_match_threshold=0.5,
             )
-            detections = []
-            for obj in result.object_prediction_list:
-                # Filter to person class only (COCO class 0)
+            det_list = []
+            for obj in res.object_prediction_list:
                 if obj.category.id == 0:
                     bb = obj.bbox
-                    detections.append([bb.minx, bb.miny, bb.maxx, bb.maxy, obj.score.value, 0])
-            return np.array(detections, dtype=np.float32) if detections else np.empty((0, 6), dtype=np.float32)
+                    det_list.append([bb.minx, bb.miny, bb.maxx, bb.maxy, obj.score.value, 0])
+            return np.array(det_list, dtype=np.float32) if det_list else np.empty((0, 6), dtype=np.float32)
         else:
-            # Standard full-frame inference (faster, less accurate for small objects)
-            results = self.model(frame, classes=[0], conf=self.config["conf_threshold"], verbose=False)
-            boxes = results[0].boxes
-            if boxes is None or len(boxes) == 0:
+            res = self.mod(frm, classes=[0], conf=self.cfg["conf_threshold"], verbose=False)
+            box = res[0].boxes
+            if box is None or len(box) == 0:
                 return np.empty((0, 6), dtype=np.float32)
-            xyxy = boxes.xyxy.cpu().numpy()
-            conf = boxes.conf.cpu().numpy().reshape(-1, 1)
-            cls  = boxes.cls.cpu().numpy().reshape(-1, 1)
-            return np.hstack([xyxy, conf, cls]).astype(np.float32)
+            xyxy = box.xyxy.cpu().numpy()
+            con = box.conf.cpu().numpy().reshape(-1, 1)
+            cls = box.cls.cpu().numpy().reshape(-1, 1)
+            return np.hstack([xyxy, con, cls]).astype(np.float32)
 
-    def process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, List]:
-        """
-        Full pipeline for a single frame:
-        1. Detect persons
-        2. Compensate for camera motion (GMC)
-        3. Update tracker
-        4. Draw visualizations
-        Returns annotated frame and list of active tracks.
-        """
+    def pro(self, frm: np.ndarray) -> Tuple[np.ndarray, List]:
         t0 = time.perf_counter()
-        self.frame_id += 1
-        h, w = frame.shape[:2]
+        self.fid += 1
+        h, w = frm.shape[:2]
 
-        # Step 1: Detect
-        detections = self.detect(frame)
+        det_arr = self.det(frm)
 
-        # Step 2: Global Motion Compensation
-        # Estimate camera's own motion so tracker doesn't confuse ego-motion with object motion
-        warp_matrix = self.gmc.apply(frame)
-        if warp_matrix is not None and len(self.tracker.tracked_stracks) > 0:
-            self.tracker.compensate_camera_motion(warp_matrix)
+        war = self.gmc.apply(frm)
+        if war is not None and len(self.trk.tracked_stracks) > 0:
+            self.trk.compensate_camera_motion(war)
 
-        # Step 3: Track
-        # ByteTrack expects [x1,y1,x2,y2,conf] — strip class column
-        dets_for_tracker = detections[:, :5] if len(detections) > 0 else np.empty((0, 5), dtype=np.float32)
-        online_targets = self.tracker.update(dets_for_tracker, [h, w], [h, w])
+        det_trk = det_arr[:, :5] if len(det_arr) > 0 else np.empty((0, 5), dtype=np.float32)
+        onl = self.trk.update(det_trk, [h, w], [h, w])
 
-        # Step 4: Update trajectory history
-        tracks_out = []
-        for t in online_targets:
+        out = []
+        for t in onl:
             tid = t.track_id
             x1, y1, x2, y2 = t.tlbr
             cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
-            self.track_history[tid].append((cx, cy))
-            tracks_out.append({
+            self.his[tid].append((cx, cy))
+            out.append({
                 "id": tid,
                 "bbox": (int(x1), int(y1), int(x2), int(y2)),
                 "center": (cx, cy),
                 "score": t.score,
-                "tail": list(self.track_history[tid]),
+                "tail": list(self.his[tid]),
             })
 
-        # Step 5: Visualize
         t1 = time.perf_counter()
-        self.fps_counter.update(t1 - t0)
-        annotated = self.viz.draw(frame, tracks_out, self.fps_counter.fps, self.frame_id)
+        self.fps.update(t1 - t0)
+        ann = self.viz.draw(frm, out, self.fps.fps, self.fid)
 
-        return annotated, tracks_out
+        return ann, out
 
-    def run_video(self, input_path: str, output_path: str):
-        """Process a video file end-to-end."""
-        cap = cv2.VideoCapture(input_path)
+    def run_vid(self, inp: str, oup: str):
+        cap = cv2.VideoCapture(inp)
         if not cap.isOpened():
-            raise IOError(f"Cannot open video: {input_path}")
+            raise IOError(f"Cannot open video: {inp}")
 
         W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps_in = cap.get(cv2.CAP_PROP_FPS)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        tot = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps_in, (W, H))
+        wri = cv2.VideoWriter(oup, cv2.VideoWriter_fourcc(*"mp4v"), fps_in, (W, H))
+        log.info(f"Processing {tot} frames ({W}x{H} @ {fps_in:.1f}fps)...")
 
-        logger.info(f"Processing {total_frames} frames ({W}x{H} @ {fps_in:.1f}fps)...")
-
-        frame_times = []
+        ftm = []
         while True:
-            ret, frame = cap.read()
+            ret, frm = cap.read()
             if not ret:
                 break
 
             t0 = time.perf_counter()
-            annotated, _ = self.process_frame(frame)
+            ann, _ = self.pro(frm)
             dt = time.perf_counter() - t0
-            frame_times.append(dt)
+            ftm.append(dt)
+            wri.write(ann)
 
-            out.write(annotated)
-
-            if self.frame_id % 50 == 0:
-                avg_fps = 1.0 / np.mean(frame_times[-50:])
-                logger.info(f"Frame {self.frame_id}/{total_frames} | Pipeline FPS: {avg_fps:.1f}")
+            if self.fid % 50 == 0:
+                avg = 1.0 / np.mean(ftm[-50:])
+                log.info(f"Frame {self.fid}/{tot} | Pipeline FPS: {avg:.1f}")
 
         cap.release()
-        out.release()
+        wri.release()
 
-        avg_fps = 1.0 / np.mean(frame_times)
-        logger.info(f"\nDone! Output: {output_path}")
-        logger.info(f"Average FPS: {avg_fps:.2f} on {self.device.upper()}")
-        return avg_fps
+        avg = 1.0 / np.mean(ftm)
+        log.info(f"\nDone! Output: {oup}")
+        log.info(f"Average FPS: {avg:.2f} on {self.dev.upper()}")
+        return avg
 
-    def run_image_sequence(self, img_dir: str, output_dir: str):
-        """Process VisDrone-style image sequence (folder of JPGs)."""
+    def run_seq(self, img_dir: str, oup_dir: str):
         img_dir = Path(img_dir)
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        oup_dir = Path(oup_dir)
+        oup_dir.mkdir(parents=True, exist_ok=True)
 
-        frames = sorted(img_dir.glob("*.jpg")) + sorted(img_dir.glob("*.png"))
-        logger.info(f"Found {len(frames)} frames in {img_dir}")
+        frms = sorted(img_dir.glob("*.jpg")) + sorted(img_dir.glob("*.png"))
+        log.info(f"Found {len(frms)} frames in {img_dir}")
 
-        frame_times = []
-        for i, fp in enumerate(frames):
-            frame = cv2.imread(str(fp))
-            if frame is None:
+        ftm = []
+        for i, fp in enumerate(frms):
+            frm = cv2.imread(str(fp))
+            if frm is None:
                 continue
 
             t0 = time.perf_counter()
-            annotated, _ = self.process_frame(frame)
-            frame_times.append(time.perf_counter() - t0)
+            ann, _ = self.pro(frm)
+            ftm.append(time.perf_counter() - t0)
 
-            out_fp = output_dir / fp.name
-            cv2.imwrite(str(out_fp), annotated)
+            cv2.imwrite(str(oup_dir / fp.name), ann)
 
             if (i + 1) % 50 == 0:
-                fps = 1.0 / np.mean(frame_times[-50:])
-                logger.info(f"  {i+1}/{len(frames)} | FPS: {fps:.1f}")
+                cur = 1.0 / np.mean(ftm[-50:])
+                log.info(f"  {i+1}/{len(frms)} | FPS: {cur:.1f}")
 
-        avg_fps = 1.0 / np.mean(frame_times) if frame_times else 0
-        logger.info(f"Average FPS: {avg_fps:.2f}")
-        return avg_fps
+        avg = 1.0 / np.mean(ftm) if ftm else 0
+        log.info(f"Average FPS: {avg:.2f}")
+        return avg
 
 
-def parse_args():
+def par_arg():
     p = argparse.ArgumentParser(description="Aerial Guardian — Drone Person Tracker")
-    p.add_argument("--input",  required=True, help="Input video or image sequence directory")
-    p.add_argument("--output", required=True, help="Output video path or directory")
-    p.add_argument("--config", default="configs/default.yaml", help="Config YAML path")
-    p.add_argument("--no-sahi", action="store_true", help="Disable SAHI slicing (faster)")
-    p.add_argument("--model",  default="weights/yolov8n.pt", help="YOLOv8 model path")
+    p.add_argument("--input",  required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--config", default="configs/default.yaml")
+    p.add_argument("--no-sahi", action="store_true")
+    p.add_argument("--model",  default="weights/yolov8n.pt")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     import yaml
-    args = parse_args()
+    arg = par_arg()
 
-    with open(args.config) as f:
-        config = yaml.safe_load(f)
+    with open(arg.config) as f:
+        cfg = yaml.safe_load(f)
 
-    if args.no_sahi:
-        config["use_sahi"] = False
-    if args.model:
-        config["model_path"] = args.model
+    if arg.no_sahi:
+        cfg["use_sahi"] = False
+    if arg.model:
+        cfg["model_path"] = arg.model
 
-    pipeline = AerialGuardianPipeline(config)
+    pip = AerialGuardianPipeline(cfg)
 
-    inp = Path(args.input)
+    inp = Path(arg.input)
     if inp.is_dir():
-        pipeline.run_image_sequence(str(inp), args.output)
+        pip.run_seq(str(inp), arg.output)
     else:
-        pipeline.run_video(str(inp), args.output)
+        pip.run_vid(str(inp), arg.output)
