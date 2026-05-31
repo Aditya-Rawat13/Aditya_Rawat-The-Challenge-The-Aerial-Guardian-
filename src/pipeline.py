@@ -39,9 +39,9 @@ class AerialGuardianPipeline:
         )
 
         self.trk = BYTETracker(cfg["tracker"])
-        self.gmc = GlobalMotionCompensation(method=cfg.get("gmc_method", "orb"))
-        self.viz = Visualizer(tail_length=cfg.get("tail_length", 30), colors_seed=42)
-        self.fps = FPSCounter(window=30)
+        self.gmc = GlobalMotionCompensation(met=cfg.get("gmc_method", "orb"), dsc=2.0)
+        self.viz = Visualizer(tai_len=cfg.get("tail_length", 30), col_sed=42)
+        self.fps = FPSCounter(win=30)
         self.fid = 0
         self.his: Dict[int, deque] = defaultdict(lambda: deque(maxlen=cfg.get("tail_length", 30)))
 
@@ -94,7 +94,7 @@ class AerialGuardianPipeline:
 
         out = []
         for t in onl:
-            tid = t.track_id
+            tid = t.tid
             x1, y1, x2, y2 = t.tlbr
             cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
             self.his[tid].append((cx, cy))
@@ -102,7 +102,7 @@ class AerialGuardianPipeline:
                 "id": tid,
                 "bbox": (int(x1), int(y1), int(x2), int(y2)),
                 "center": (cx, cy),
-                "score": t.score,
+                "score": t.sco,
                 "tail": list(self.his[tid]),
             })
 
